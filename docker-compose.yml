@@ -1,0 +1,63 @@
+# PrintWatch: Obico's failure detector pointed at a Bambu Lab P1S.
+#
+# Obico has no Bambu support of its own, so only its ml_api detector is used --
+# the web/tasks/postgres/redis stack is not deployed. ml_api gets no host port:
+# it is reachable only from the bridge over the internal network, which matters
+# because ml_api's auth decorator degrades to passthrough if ML_API_TOKEN is
+# ever unset. Home Assistant talks to the bridge and nothing else.
+
+services:
+  ml_api:
+    image: obico-ml-api:cpu
+    container_name: printwatch-ml-api
+    restart: unless-stopped
+    environment:
+      ML_API_TOKEN: ${ML_API_TOKEN:?set ML_API_TOKEN in .env}
+    networks: [printwatch]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3333/hc/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          # ONNX Runtime on CPU. One inference is ~135ms and the loop runs a few
+          # times per hour, so this never competes with Ollama for the GPU.
+          cpus: "2.0"
+          memory: 2G
+
+  bridge:
+    build: .
+    image: printwatch-bridge:latest
+    container_name: printwatch-bridge
+    restart: unless-stopped
+    environment:
+      BAMBU_HOST: ${BAMBU_HOST:?set BAMBU_HOST in .env}
+      BAMBU_CODE: ${BAMBU_CODE:?set BAMBU_CODE in .env}
+      BAMBU_SERIAL: ${BAMBU_SERIAL:?set BAMBU_SERIAL in .env}
+      ML_API_URL: http://ml_api:3333
+      ML_API_TOKEN: ${ML_API_TOKEN}
+      SELF_URL: http://bridge:8099
+      STALE_SECONDS: "30"
+      # Re-find the printer automatically after sustained connection failure --
+      # a router reboot can move its DHCP lease to a new address.
+      AUTO_DISCOVER: "1"
+      FAILS_BEFORE_DISCOVER: "6"
+    volumes:
+      # A rediscovered IP is written here so it survives container recreation.
+      # Without this, recreating the container would revert to the stale
+      # BAMBU_HOST from .env and undo the recovery.
+      - ./state:/state
+    ports:
+      # Published on the LAN so Home Assistant (a separate VM) can reach it.
+      - "8099:8099"
+    networks: [printwatch]
+    depends_on:
+      ml_api:
+        condition: service_started
+
+networks:
+  printwatch:
+    driver: bridge

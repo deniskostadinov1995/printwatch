@@ -1,0 +1,11 @@
+.env
+*.pyc
+__pycache__/
+vendor/
+
+# Runtime state and logs
+state/
+*.log
+
+# Upstream checkout used to build the ml_api image
+obico-server/

@@ -1,0 +1,640 @@
+# PrintWatch -- Bambu P1S failure monitoring via Obico's detector.
+#
+# Install as a package:  /config/packages/printwatch.yaml
+# and ensure configuration.yaml contains:
+#
+#   homeassistant:
+#     packages: !include_dir_named packages
+#
+# >>> Replace every 192.168.1.50 in this file with the LAN IP of the PC that runs
+# >>> the bridge, and notify.mobile_app_your_phone / media_player.kitchen_echo
+# >>> with your own notify service and speaker (or delete those steps).
+#
+# The bridge runs on a PC at 192.168.1.50:8099 (Docker). It owns the
+# printer connections; Home Assistant owns the cadence and every decision.
+#
+# CALIBRATION NOTE: the alert threshold below is a starting guess, not a tuned
+# value. Verified locally: healthy frames from this printer score 0.000, and
+# Obico's own `detached-1` fixture scores 0.265. There is no real spaghetti
+# sample from this printer yet, so run in learn mode for a few prints and look
+# at sensor.printwatch_last_score before trusting the threshold.
+
+# ---------------------------------------------------------------- commands --
+rest_command:
+  printwatch_light_on:
+    url: "http://192.168.1.50:8099/light/on"
+    method: POST
+    timeout: 10
+
+  printwatch_light_off:
+    url: "http://192.168.1.50:8099/light/off"
+    method: POST
+    timeout: 10
+
+  printwatch_detect:
+    url: "http://192.168.1.50:8099/detect"
+    method: GET
+    timeout: 45
+
+  printwatch_pause:
+    url: "http://192.168.1.50:8099/pause"
+    method: POST
+    timeout: 20
+
+  printwatch_resume:
+    url: "http://192.168.1.50:8099/resume"
+    method: POST
+    timeout: 20
+
+  # Rescans the LAN for the printer after a DHCP move. Slow by nature: it port
+  # scans a /24 and then proves identity by FTPS login, so allow generous time.
+  printwatch_rediscover:
+    url: "http://192.168.1.50:8099/rediscover"
+    method: POST
+    timeout: 120
+
+# NOTE: the chamber camera is NOT defined here. The mjpeg platform is
+# config-flow only in modern HA (YAML support removed), so it lives as a config
+# entry created through the UI/API instead:
+#   name            P1S Chamber
+#   mjpeg_url       http://192.168.1.50:8099/stream.mjpeg
+#   still_image_url http://192.168.1.50:8099/snapshot.jpg
+# Recreate via Settings > Devices & Services > Add Integration > MJPEG IP Camera.
+
+# ----------------------------------------------------------------- sensors --
+sensor:
+  - platform: rest
+    name: PrintWatch Status
+    unique_id: printwatch_status
+    resource: "http://192.168.1.50:8099/status.json"
+    scan_interval: 30
+    timeout: 15
+    value_template: "{{ value_json.gcode_state | default('unknown') }}"
+    json_attributes:
+      - printing
+      - checkable
+      - progress
+      - layer
+      - total_layers
+      - job
+      - remaining_min
+      - chamber_light
+      - printer_ip
+      - print_type
+      - pause_possible
+      - last_discovery
+      - camera_connected
+      - mqtt_connected
+      - camera_frames
+      - camera_reconnects
+      - hms_count
+
+template:
+  - sensor:
+      - name: PrintWatch Progress
+        unique_id: printwatch_progress
+        unit_of_measurement: "%"
+        state: >
+          {{ state_attr('sensor.printwatch_status', 'progress') | int(0) }}
+
+      - name: PrintWatch Job
+        unique_id: printwatch_job
+        state: >
+          {{ state_attr('sensor.printwatch_status', 'job') | default('none', true) }}
+
+      - name: PrintWatch Layer
+        unique_id: printwatch_layer
+        state: >
+          {{ state_attr('sensor.printwatch_status', 'layer') | int(0) }}/{{
+             state_attr('sensor.printwatch_status', 'total_layers') | int(0) }}
+
+      # One human-readable line so the dashboard never makes you interpret
+      # raw scores to know whether you are protected right now.
+      - name: PrintWatch Printer IP
+        unique_id: printwatch_printer_ip
+        icon: mdi:ip-network
+        state: >
+          {{ state_attr('sensor.printwatch_status', 'printer_ip') | default('unknown', true) }}
+
+      - name: PrintWatch Verdict
+        unique_id: printwatch_verdict
+        icon: >
+          {% if not is_state('binary_sensor.printwatch_bridge_healthy','on') %}
+            mdi:lan-disconnect
+          {% elif is_state('input_boolean.printwatch_enabled','off') %}
+            mdi:pause-circle
+          {% elif not is_state('binary_sensor.printwatch_printing','on') %}
+            mdi:sleep
+          {% elif states('input_number.printwatch_strikes')|int(0) > 0 %}
+            mdi:alert
+          {% else %}
+            mdi:check-circle
+          {% endif %}
+        state: >
+          {% set score = states('input_number.printwatch_score')|float(0) %}
+          {% set thr = states('input_number.printwatch_threshold')|float(0.3) %}
+          {% set strikes = states('input_number.printwatch_strikes')|int(0) %}
+          {% if not is_state('binary_sensor.printwatch_bridge_healthy','on') %}
+            Bridge offline
+          {% elif is_state('input_boolean.printwatch_enabled','off') %}
+            Monitoring off
+          {% elif not is_state('binary_sensor.printwatch_printing','on') %}
+            Idle - no print
+          {% elif strikes >= 2 %}
+            FAILURE SUSPECTED
+          {% elif score >= thr %}
+            Suspect (1 of 2 strikes)
+          {% else %}
+            Print looks OK
+          {% endif %}
+
+  - binary_sensor:
+      - name: PrintWatch Printing
+        unique_id: printwatch_printing
+        device_class: running
+        state: >
+          {{ state_attr('sensor.printwatch_status', 'printing') | default(false) }}
+
+      # The bridge is the only thing holding the printer connections open. If it
+      # dies, every score silently reads 0.0 -- which looks exactly like a
+      # healthy print. Alert on this rather than trusting a quiet monitor.
+      # Cloud-started prints refuse local pause commands outright. Surfacing
+      # this as its own sensor means you learn that BEFORE a failure, not from
+      # a notification at 3am telling you the pause did not work.
+      - name: PrintWatch Pause Available
+        unique_id: printwatch_pause_available
+        device_class: problem
+        # Only a problem when it actually matters: a print is running AND it was
+        # started from the cloud, so a failure could not be stopped. Flagging
+        # this while idle would just be noise.
+        state: >
+          {{ is_state('binary_sensor.printwatch_printing', 'on')
+             and state_attr('sensor.printwatch_status', 'print_type') == 'cloud' }}
+
+      - name: PrintWatch Bridge Healthy
+        unique_id: printwatch_bridge_healthy
+        # connectivity, NOT problem: this template returns `on` to mean healthy,
+        # and device_class `problem` defines on = problem detected, which would
+        # render a perfectly healthy bridge as "Problem". connectivity maps
+        # on -> Connected, which is what this actually reports.
+        device_class: connectivity
+        state: >
+          {{ not (
+               states('sensor.printwatch_status') in
+                 ['unknown', 'unavailable', 'none']
+               or state_attr('sensor.printwatch_status', 'mqtt_connected') != true
+             ) }}
+
+# ----------------------------------------------------------------- helpers --
+input_boolean:
+  printwatch_enabled:
+    name: PrintWatch Enabled
+    icon: mdi:printer-3d-nozzle-alert
+
+  printwatch_learn_mode:
+    name: PrintWatch Learn Mode (log scores, never alert)
+    icon: mdi:school
+
+  printwatch_auto_pause:
+    name: PrintWatch Auto-Pause on Failure
+    icon: mdi:pause-octagon
+
+input_number:
+  printwatch_score:
+    name: PrintWatch Smoothed Score
+    min: 0
+    max: 1
+    step: 0.0001
+    mode: box
+    icon: mdi:chart-line
+
+  printwatch_threshold:
+    name: PrintWatch Alert Threshold
+    min: 0.02
+    max: 1
+    step: 0.01
+    # 0.10, NOT 0.30. The smoothed score converges toward the raw score and can
+    # never exceed it, and the only confirmed failure sample scored 0.265 raw --
+    # so a 0.30 threshold is mathematically unreachable and would never fire.
+    # Healthy frames from this printer score exactly 0.000 (ml_api finds zero
+    # boxes above its own 0.08 confidence floor), so the gap is wide and 0.10
+    # sits safely inside it.
+    initial: 0.10
+    mode: box
+    icon: mdi:tune
+
+  printwatch_strikes:
+    name: PrintWatch Consecutive Strikes
+    min: 0
+    max: 10
+    step: 1
+    mode: box
+    icon: mdi:counter
+
+input_text:
+  printwatch_last_score:
+    name: PrintWatch Last Raw Score
+    max: 120
+
+  printwatch_last_check:
+    name: PrintWatch Last Check
+    max: 120
+
+# ----------------------------------------------------------------- scripts --
+script:
+  printwatch_check_now:
+    alias: "PrintWatch: check now"
+    icon: mdi:magnify-scan
+    mode: single
+    description: >
+      Run one detection immediately, whatever the printer is doing. This is the
+      dashboard's test button -- the scheduled automation only fires mid-print,
+      so without this there is no way to prove the pipeline works on demand.
+    sequence:
+      - action: rest_command.printwatch_light_on
+        continue_on_error: true
+      - delay: "00:00:03"
+      - action: rest_command.printwatch_detect
+        response_variable: det
+      - variables:
+          ok: "{{ det.content.ok | default(false) if det.content is defined else false }}"
+          raw: "{{ det.content.score | float(0) if det.content is defined else 0 }}"
+      - choose:
+          - conditions: "{{ not ok }}"
+            sequence:
+              - action: input_text.set_value
+                target: { entity_id: input_text.printwatch_last_check }
+                data:
+                  value: >
+                    {{ now().strftime('%H:%M') }} FAILED:
+                    {{ (det.content.error | default('unreachable'))[:70] }}
+        default:
+          - action: input_text.set_value
+            target: { entity_id: input_text.printwatch_last_check }
+            data:
+              value: >
+                {{ now().strftime('%H:%M') }} score={{ raw }}
+                ({{ det.content.n | default(0) }} boxes,
+                {{ det.content.ms | default(0) }}ms) -
+                {{ 'LOOKS OK' if raw < (states('input_number.printwatch_threshold') | float(0.3)) else 'SUSPECT' }}
+
+  printwatch_find_printer:
+    alias: "PrintWatch: find printer"
+    icon: mdi:lan-connect
+    mode: single
+    description: >
+      Rescan the network for the printer and reconnect. Use when the dashboard
+      says the bridge is disconnected -- normally caused by a router reboot
+      moving the printer to a new DHCP address.
+    sequence:
+      - action: input_text.set_value
+        target: { entity_id: input_text.printwatch_last_check }
+        data: { value: "searching for printer..." }
+      - action: rest_command.printwatch_rediscover
+        response_variable: disc
+      - variables:
+          found: "{{ disc.content.ok | default(false) if disc.content is defined else false }}"
+      - choose:
+          - conditions: "{{ found }}"
+            sequence:
+              - action: input_text.set_value
+                target: { entity_id: input_text.printwatch_last_check }
+                data:
+                  value: >
+                    {{ now().strftime('%H:%M') }} printer found at
+                    {{ disc.content.ip }}{{ ' (address changed)' if disc.content.changed else ' (unchanged)' }}
+              # The REST sensor polls every 30s; force it so the tile updates now.
+              - action: homeassistant.update_entity
+                target: { entity_id: sensor.printwatch_status }
+        default:
+          - action: input_text.set_value
+            target: { entity_id: input_text.printwatch_last_check }
+            data:
+              value: >
+                {{ now().strftime('%H:%M') }} NOT FOUND:
+                {{ (disc.content.error | default('bridge unreachable'))[:60] }}
+
+  printwatch_pause_print:
+    alias: "PrintWatch: pause print"
+    icon: mdi:pause
+    mode: single
+    sequence:
+      - action: rest_command.printwatch_pause
+        response_variable: r
+      - action: input_text.set_value
+        target: { entity_id: input_text.printwatch_last_check }
+        data:
+          value: >
+            {{ now().strftime('%H:%M') }} pause:
+            {{ r.content.detail | default('no response') if r.content is defined else 'no response' }}
+      - action: homeassistant.update_entity
+        target: { entity_id: sensor.printwatch_status }
+
+  printwatch_resume_print:
+    alias: "PrintWatch: resume print"
+    icon: mdi:play
+    mode: single
+    sequence:
+      - action: rest_command.printwatch_resume
+        response_variable: r
+      - action: input_text.set_value
+        target: { entity_id: input_text.printwatch_last_check }
+        data:
+          value: >
+            {{ now().strftime('%H:%M') }} resume:
+            {{ r.content.detail | default('no response') if r.content is defined else 'no response' }}
+      # Clear the strike state so the watcher does not immediately re-pause a
+      # print you have judged to be fine.
+      - action: input_number.set_value
+        target: { entity_id: input_number.printwatch_score }
+        data: { value: 0 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.printwatch_strikes }
+        data: { value: 0 }
+      - action: homeassistant.update_entity
+        target: { entity_id: sensor.printwatch_status }
+
+  printwatch_reset_counters:
+    alias: "PrintWatch: reset score"
+    icon: mdi:restart
+    mode: single
+    sequence:
+      - action: input_number.set_value
+        target: { entity_id: input_number.printwatch_score }
+        data: { value: 0 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.printwatch_strikes }
+        data: { value: 0 }
+      - action: input_text.set_value
+        target: { entity_id: input_text.printwatch_last_score }
+        data: { value: "reset" }
+
+# -------------------------------------------------------------- automation --
+automation:
+  - id: printwatch_check
+    alias: "PrintWatch: check print health"
+    description: >
+      Every 5 minutes during a print, force the chamber light on and run the
+      detector. A first hit above threshold triggers an immediate 75-second
+      re-check rather than waiting for the next 5-minute cycle, so a real
+      failure is confirmed in about a minute instead of ten. Two consecutive
+      hits pause the print (if auto-pause is on) and alert.
+    mode: single
+    max_exceeded: silent
+
+    triggers:
+      - trigger: time_pattern
+        minutes: "/5"
+
+    conditions:
+      - condition: state
+        entity_id: input_boolean.printwatch_enabled
+        state: "on"
+      - condition: template
+        value_template: >
+          {{ state_attr('sensor.printwatch_status', 'printing') == true }}
+      - condition: template
+        value_template: >
+          {% set p = state_attr('sensor.printwatch_status', 'progress') | int(-1) %}
+          {{ 2 <= p <= 98 }}
+
+    actions:
+      # Detection is worthless in the dark. One of this printer's own timelapses
+      # had 133 of 149 frames effectively black because the light was off.
+      - action: rest_command.printwatch_light_on
+        continue_on_error: true
+      - delay: "00:00:03"
+
+      - action: rest_command.printwatch_detect
+        response_variable: det
+      - variables:
+          ok1: "{{ det.content.ok | default(false) if det.content is defined else false }}"
+          raw1: "{{ det.content.score | float(0) if det.content is defined else 0 }}"
+          thr: "{{ states('input_number.printwatch_threshold') | float(0.10) }}"
+          ewm1: >
+            {{ (0.4 * (det.content.score | float(0) if det.content is defined else 0)
+                + 0.6 * (states('input_number.printwatch_score') | float(0))) | round(4) }}
+
+      # A failed fetch must not be folded in as a clean 0.0 -- that would let a
+      # broken camera quietly wash out a real detection.
+      - choose:
+          - conditions: "{{ not ok1 }}"
+            sequence:
+              - action: input_text.set_value
+                target: { entity_id: input_text.printwatch_last_score }
+                data:
+                  value: >
+                    error: {{ (det.content.error | default('unknown'))[:100] }}
+              - stop: "detector unavailable this cycle"
+
+      - action: input_number.set_value
+        target: { entity_id: input_number.printwatch_score }
+        data: { value: "{{ ewm1 }}" }
+      - action: input_text.set_value
+        target: { entity_id: input_text.printwatch_last_score }
+        data:
+          value: >
+            raw={{ raw1 }} ewm={{ ewm1 }} n={{ det.content.n | default(0) }}
+            layer={{ state_attr('sensor.printwatch_status','layer') }}
+
+      # Below threshold: decay the strike counter and finish.
+      - choose:
+          - conditions: "{{ ewm1 | float(0) < thr | float(0.10) }}"
+            sequence:
+              - action: input_number.set_value
+                target: { entity_id: input_number.printwatch_strikes }
+                data:
+                  value: >
+                    {{ [ (states('input_number.printwatch_strikes')|int(0)) - 1, 0 ] | max }}
+              - stop: "looks fine"
+
+      # --- first hit: confirm fast rather than waiting five minutes --------
+      - action: input_number.set_value
+        target: { entity_id: input_number.printwatch_strikes }
+        data: { value: 1 }
+      - delay: "00:01:15"
+
+      # Bail out if the print ended or was stopped during the wait.
+      - condition: template
+        value_template: >
+          {{ state_attr('sensor.printwatch_status', 'printing') == true }}
+
+      - action: rest_command.printwatch_detect
+        response_variable: det2
+      - variables:
+          ok2: "{{ det2.content.ok | default(false) if det2.content is defined else false }}"
+          raw2: "{{ det2.content.score | float(0) if det2.content is defined else 0 }}"
+          ewm2: >
+            {{ (0.4 * (det2.content.score | float(0) if det2.content is defined else 0)
+                + 0.6 * (states('input_number.printwatch_score') | float(0))) | round(4) }}
+
+      - action: input_text.set_value
+        target: { entity_id: input_text.printwatch_last_score }
+        data:
+          value: >
+            recheck raw={{ raw2 }} ewm={{ ewm2 }}
+            layer={{ state_attr('sensor.printwatch_status','layer') }}
+
+      # Second reading cleared it -> stand down. One odd frame is not a failure.
+      - choose:
+          - conditions: "{{ not ok2 or (ewm2 | float(0) < thr | float(0.10)) }}"
+            sequence:
+              - action: input_number.set_value
+                target: { entity_id: input_number.printwatch_score }
+                data: { value: "{{ ewm2 if ok2 else ewm1 }}" }
+              - action: input_number.set_value
+                target: { entity_id: input_number.printwatch_strikes }
+                data: { value: 0 }
+              - stop: "recheck cleared it"
+
+      # --- confirmed failure -----------------------------------------------
+      - action: input_number.set_value
+        target: { entity_id: input_number.printwatch_score }
+        data: { value: "{{ ewm2 }}" }
+      - action: input_number.set_value
+        target: { entity_id: input_number.printwatch_strikes }
+        data: { value: 2 }
+
+      - condition: state
+        entity_id: input_boolean.printwatch_learn_mode
+        state: "off"
+
+      # Pause FIRST, then notify. If the notification path is broken or the
+      # phone is asleep, the filament has still stopped -- which is the entire
+      # point of pausing rather than only alerting.
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.printwatch_auto_pause
+                state: "on"
+            sequence:
+              - action: rest_command.printwatch_pause
+                response_variable: pr
+                continue_on_error: true
+              - action: input_text.set_value
+                target: { entity_id: input_text.printwatch_last_check }
+                data:
+                  value: >
+                    {{ now().strftime('%H:%M') }} AUTO-PAUSE:
+                    {{ pr.content.detail | default('no response') if pr is defined and pr.content is defined else 'no response' }}
+
+      # Ground truth, not intent: re-read the printer and see whether it really
+      # stopped. A publish can succeed while the printer ignores the command
+      # (cloud-started prints do exactly that), and a monitor that claims a
+      # pause it did not achieve is worse than one that admits the failure.
+      - action: homeassistant.update_entity
+        target: { entity_id: sensor.printwatch_status }
+      - delay: "00:00:02"
+      - variables:
+          paused: "{{ is_state('sensor.printwatch_status', 'PAUSE') }}"
+
+      - action: notify.mobile_app_your_phone
+        data:
+          title: >
+            {{ 'Print PAUSED - suspected failure' if paused
+               else '3D PRINT FAILING - STILL RUNNING' }}
+          message: >
+            {{ state_attr('sensor.printwatch_status','job') }} --
+            layer {{ state_attr('sensor.printwatch_status','layer') }} of
+            {{ state_attr('sensor.printwatch_status','total_layers') }},
+            {{ state_attr('sensor.printwatch_status','progress') }}%.
+            Score {{ ewm2 }}.
+            {{ 'The print has been paused - check the camera, then Resume or Stop.'
+               if paused
+               else ('COULD NOT PAUSE - stop it yourself. '
+                     + ('Cloud-started print refuses local pause.'
+                        if state_attr('sensor.printwatch_status','print_type') == 'cloud'
+                        else 'Auto-pause is off or the command failed.')) }}
+          data:
+            image: "http://192.168.1.50:8099/snapshot.jpg"
+            push:
+              interruption-level: time-sensitive
+
+      - action: alexa_devices.send_text_command
+        data:
+          text: >
+            tell me that the 3D print
+            {{ 'has been paused' if paused
+               else 'is failing and could not be paused' }}
+            at {{ state_attr('sensor.printwatch_status','progress') }} percent
+        target:
+          entity_id: media_player.kitchen_echo
+        continue_on_error: true
+
+  # ---- reset state when a new print starts -------------------------------
+  - id: printwatch_reset
+    alias: "PrintWatch: reset on new print"
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.printwatch_printing
+        to: "on"
+    actions:
+      - action: input_number.set_value
+        target: { entity_id: input_number.printwatch_score }
+        data: { value: 0 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.printwatch_strikes }
+        data: { value: 0 }
+
+  # ---- stall detection: the failure vision cannot see ---------------------
+  # ml_api only detects spaghetti. A print that detaches and vanishes, or a
+  # printer that freezes mid-job, produces a perfectly clean frame. Layer
+  # number not advancing for 20 minutes catches what the camera cannot.
+  - id: printwatch_stalled
+    alias: "PrintWatch: print appears stalled"
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: sensor.printwatch_layer
+        for: "00:20:00"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.printwatch_enabled
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.printwatch_printing
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.printwatch_learn_mode
+        state: "off"
+      - condition: template
+        value_template: >
+          {% set p = state_attr('sensor.printwatch_status', 'progress') | int(-1) %}
+          {{ 2 <= p <= 98 }}
+    actions:
+      # Deliberately NOTIFY-ONLY, no auto-pause. A genuinely frozen printer is
+      # already not extruding, so pausing gains nothing; but a legitimately slow
+      # layer (large flat area) can exceed 20 minutes, and pausing that would
+      # ruin a perfectly good print. Vision-confirmed spaghetti pauses; this
+      # does not.
+      - action: notify.mobile_app_your_phone
+        data:
+          title: "3D print may be stalled"
+          message: >
+            Layer has not advanced in 20 minutes -- still
+            {{ states('sensor.printwatch_layer') }} at
+            {{ state_attr('sensor.printwatch_status','progress') }}%.
+          data:
+            image: "http://192.168.1.50:8099/snapshot.jpg"
+
+  # ---- tell me if the monitor itself dies mid-print -----------------------
+  - id: printwatch_bridge_down
+    alias: "PrintWatch: bridge unreachable during a print"
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.printwatch_bridge_healthy
+        to: "off"
+        for: "00:05:00"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.printwatch_enabled
+        state: "on"
+    actions:
+      - action: notify.mobile_app_your_phone
+        data:
+          title: "PrintWatch is blind"
+          message: >
+            The print monitor lost its connection to the printer. Prints are
+            not being checked.
